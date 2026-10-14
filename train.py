@@ -1,280 +1,251 @@
-"""
-Entrenamiento de clasificación de números escritos a mano (0..9) con:
-1) Árbol de Decisión
-2) Random Forest
-
-Dataset esperado:
-dataset/
-├── 0/
-├── 1/
-...
-└── 9/
-
-Cada carpeta contiene imágenes del dígito correspondiente sobre fondo blanco.
-"""
+"""Entrena un Árbol de Decisión y un Random Forest para estimar la nota IMDb."""
 
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+import csv
+import io
+import math
+from collections import Counter
 from pathlib import Path
+from typing import Any
+from zipfile import BadZipFile, ZipFile
 
 import joblib
-import kagglehub
 import numpy as np
-from PIL import Image, ImageOps
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.tree import DecisionTreeRegressor
 
-VALID_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 RANDOM_STATE = 42
-DEFAULT_DATASET_SLUG = "karnikakapoor/digits"
+DEFAULT_DATASET_ZIP = Path("data") / "archive (1).zip"
+DEFAULT_CSV_NAME = "mflix.movies.csv"
 DEFAULT_MODEL_PATH = Path("modelo.joblib")
-EXPECTED_CLASSES = list(range(10))
+NUMERIC_COLUMNS = {
+    "year": "year",
+    "runtime": "runtime",
+    "imdb_votes": "imdb.votes",
+    "awards_wins": "awards.wins",
+    "awards_nominations": "awards.nominations",
+}
+GENRE_COLUMN = "genres[0]"
+TARGET_COLUMN = "imdb.rating"
+REQUIRED_COLUMNS = {*NUMERIC_COLUMNS.values(), GENRE_COLUMN, TARGET_COLUMN}
 
 
 def parse_args() -> argparse.Namespace:
-    """Configura argumentos para controlar dataset, tamaño de imagen y salida."""
     parser = argparse.ArgumentParser(
-        description="Entrena modelos de clasificación para dígitos escritos a mano (0..9)."
+        description="Entrena modelos de regresión para estimar la nota IMDb de películas Mflix."
     )
     parser.add_argument(
-        "--dataset-root",
+        "--dataset-zip",
         type=Path,
-        default=None,
-        help=(
-            "Ruta raíz local del dataset con carpetas 0..9. "
-            "Si se omite, se descargará automáticamente desde Kaggle."
-        ),
+        default=DEFAULT_DATASET_ZIP,
+        help=f"ZIP del dataset Mflix. Por defecto: {DEFAULT_DATASET_ZIP}",
     )
     parser.add_argument(
-        "--dataset-slug",
+        "--csv-name",
         type=str,
-        default=DEFAULT_DATASET_SLUG,
-        help=f"Dataset de Kaggle a descargar si no se indica --dataset-root. Por defecto: {DEFAULT_DATASET_SLUG}",
+        default=DEFAULT_CSV_NAME,
+        help=f"CSV dentro del ZIP que se usará para entrenar. Por defecto: {DEFAULT_CSV_NAME}",
     )
     parser.add_argument(
         "--model-path",
         type=Path,
         default=DEFAULT_MODEL_PATH,
-        help="Ruta de salida del modelo joblib. Por defecto: ./modelo.joblib",
-    )
-    parser.add_argument(
-        "--image-size",
-        type=int,
-        default=28,
-        help="Tamaño final cuadrado de entrada (ejemplo: 28 para 28x28).",
-    )
-    parser.add_argument(
-        "--max-images-per-class",
-        type=int,
-        default=0,
-        help=(
-            "Límite por clase para reducir peso/tiempo (0 = usar todas las imágenes). "
-            "Útil para pruebas rápidas."
-        ),
+        help="Ruta del artefacto de salida. Por defecto: ./modelo.joblib",
     )
     return parser.parse_args()
 
 
-def infer_digit_label(image_path: Path) -> int | None:
-    """Devuelve la etiqueta del dígito según la carpeta ancestro '0'..'9'."""
-    for part in reversed(image_path.parts):
-        if part.isdigit() and len(part) == 1:
-            return int(part)
-    return None
+def _number_or_none(row: dict[str, str], column: str) -> float | None:
+    value = row.get(column, "")
+    if not value or not value.strip():
+        return None
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
 
 
-def collect_labeled_images(dataset_root: Path, max_images_per_class: int) -> list[tuple[Path, int]]:
-    """Encuentra imágenes válidas y aplica muestreo opcional por clase."""
-    images_by_label: dict[int, list[Path]] = defaultdict(list)
+def load_dataset(
+    dataset_zip: Path, csv_name: str
+) -> tuple[list[dict[str, Any]], np.ndarray, dict[str, Any]]:
+    """Lee el CSV directamente desde el ZIP y omite filas sin datos utilizables."""
+    if not dataset_zip.is_file():
+        raise FileNotFoundError(f"No existe el archivo ZIP indicado: {dataset_zip}")
 
-    for file_path in dataset_root.rglob("*"):
-        if not file_path.is_file():
-            continue
-        if file_path.suffix.lower() not in VALID_IMAGE_EXTENSIONS:
-            continue
+    try:
+        archive = ZipFile(dataset_zip)
+    except BadZipFile as error:
+        raise ValueError(f"El archivo no es un ZIP válido: {dataset_zip}") from error
 
-        label = infer_digit_label(file_path)
-        if label is None or label not in EXPECTED_CLASSES:
-            continue
-        images_by_label[label].append(file_path)
+    with archive:
+        if csv_name not in archive.namelist():
+            available_csvs = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+            raise FileNotFoundError(
+                f"No se encontró {csv_name!r} dentro del ZIP. CSV disponibles: {available_csvs}"
+            )
 
-    for label, paths in images_by_label.items():
-        paths.sort()
-        if max_images_per_class > 0:
-            images_by_label[label] = paths[:max_images_per_class]
+        feature_rows: list[dict[str, Any]] = []
+        targets: list[float] = []
+        skipped_missing = 0
+        skipped_non_movies = 0
+        with archive.open(csv_name) as binary_file:
+            text_file = io.TextIOWrapper(binary_file, encoding="utf-8-sig", newline="")
+            reader = csv.DictReader(text_file)
+            available_columns = set(reader.fieldnames or [])
+            missing_columns = sorted(REQUIRED_COLUMNS - available_columns)
+            if missing_columns:
+                raise ValueError(
+                    f"El CSV {csv_name!r} no contiene las columnas necesarias: {missing_columns}"
+                )
 
-    labeled_images: list[tuple[Path, int]] = []
-    for label in EXPECTED_CLASSES:
-        labeled_images.extend((image_path, label) for image_path in images_by_label.get(label, []))
+            for row in reader:
+                if row.get("type", "").strip().lower() not in ("", "movie"):
+                    skipped_non_movies += 1
+                    continue
 
-    return labeled_images
+                rating = _number_or_none(row, TARGET_COLUMN)
+                genre = row.get(GENRE_COLUMN, "").strip()
+                values = {
+                    feature_name: _number_or_none(row, column)
+                    for feature_name, column in NUMERIC_COLUMNS.items()
+                }
+                if rating is None or not genre or any(value is None for value in values.values()):
+                    skipped_missing += 1
+                    continue
+                if not 0 <= rating <= 10:
+                    skipped_missing += 1
+                    continue
 
+                feature_rows.append({**values, "genre": genre})
+                targets.append(rating)
 
-def preprocess_image_to_vector(image_path: Path, image_size: int) -> np.ndarray:
-    """
-    Convierte cada imagen a vector de entrada:
-    - Escala de grises
-    - Redimensión a image_size x image_size
-    - Normalización [0, 1]
-    - Aplanado 1D
-    """
-    with Image.open(image_path) as img:
-        grayscale = ImageOps.grayscale(img)
-        resized = grayscale.resize((image_size, image_size))
-        image_array = np.asarray(resized, dtype=np.float32) / 255.0
-    return image_array.reshape(-1)
-
-
-def load_dataset(dataset_root: Path, image_size: int, max_images_per_class: int) -> tuple[np.ndarray, np.ndarray]:
-    """Carga y transforma el dataset a matrices X e y para scikit-learn."""
-    if not dataset_root.exists():
-        raise FileNotFoundError(
-            f"No existe la ruta del dataset: {dataset_root}\n"
-            "Crea la carpeta y añade subcarpetas 0..9 con imágenes."
-        )
-
-    labeled_images = collect_labeled_images(dataset_root, max_images_per_class=max_images_per_class)
-    if not labeled_images:
-        raise FileNotFoundError(
-            "No se encontraron imágenes etiquetadas. "
-            "Verifica que existan carpetas 0..9 con imágenes dentro."
-        )
-
-    labels_found = sorted({label for _, label in labeled_images})
-    missing_labels = [label for label in EXPECTED_CLASSES if label not in labels_found]
-    if missing_labels:
+    if len(feature_rows) < 10:
         raise ValueError(
-            "Faltan clases obligatorias en el dataset: "
-            f"{missing_labels}. Deben existir carpetas 0..9 con ejemplos."
+            f"Solo se encontraron {len(feature_rows)} filas válidas; se necesitan al menos 10."
         )
 
-    feature_rows: list[np.ndarray] = []
-    labels: list[int] = []
-    for image_path, label in labeled_images:
-        feature_rows.append(preprocess_image_to_vector(image_path=image_path, image_size=image_size))
-        labels.append(label)
+    numeric_values = {
+        name: np.asarray([float(row[name]) for row in feature_rows], dtype=np.float64)
+        for name in NUMERIC_COLUMNS
+    }
+    genre_counts = Counter(str(row["genre"]) for row in feature_rows)
+    metadata = {
+        "dataset_type": "mflix-movie-rating-regression",
+        "dataset_file": csv_name,
+        "target": TARGET_COLUMN,
+        "feature_names": list(NUMERIC_COLUMNS) + ["genre"],
+        "row_count": len(feature_rows),
+        "skipped_missing": skipped_missing,
+        "skipped_non_movies": skipped_non_movies,
+        "genres": sorted(genre_counts),
+        "default_genre": genre_counts.most_common(1)[0][0],
+        "feature_ranges": {
+            name: {"min": float(values.min()), "max": float(values.max())}
+            for name, values in numeric_values.items()
+        },
+        "feature_defaults": {
+            name: float(np.median(values)) for name, values in numeric_values.items()
+        },
+    }
+    return feature_rows, np.asarray(targets, dtype=np.float64), metadata
 
-    X = np.vstack(feature_rows)
-    y = np.asarray(labels, dtype=np.int32)
-    return X, y
 
-
-def resolve_dataset_root(dataset_root: Path | None, dataset_slug: str) -> Path:
-    """Resuelve dataset local o descarga automática de Kaggle."""
-    if dataset_root is not None:
-        if not dataset_root.exists():
-            raise FileNotFoundError(f"No existe la ruta local indicada: {dataset_root}")
-        print(f"[2/6] Usando dataset local: {dataset_root.resolve()}")
-        return dataset_root
-
-    print(f"[2/6] Descargando dataset desde Kaggle Hub: {dataset_slug}")
-    downloaded_path = Path(kagglehub.dataset_download(dataset_slug))
-    if not downloaded_path.exists():
-        raise FileNotFoundError(f"Se descargó el dataset pero la ruta no existe: {downloaded_path}")
-    print(f"Dataset descargado en: {downloaded_path}")
-    return downloaded_path
-
-
-def train_models(X_train: np.ndarray, y_train: np.ndarray) -> tuple[DecisionTreeClassifier, RandomForestClassifier]:
-    """Entrena Árbol de Decisión y Random Forest con configuración educativa."""
-    print("[4/6] Entrenando Árbol de Decisión (Gini)...")
-    decision_tree = DecisionTreeClassifier(
-        criterion="gini",
-        max_depth=18,
-        min_samples_leaf=2,
-        random_state=RANDOM_STATE,
+def make_models() -> tuple[Pipeline, Pipeline]:
+    """Crea modelos interpretables y de conjunto con codificación categórica."""
+    decision_tree = Pipeline(
+        [
+            ("vectorizer", DictVectorizer()),
+            (
+                "regressor",
+                DecisionTreeRegressor(
+                    criterion="squared_error",
+                    max_depth=12,
+                    min_samples_leaf=10,
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
     )
-    decision_tree.fit(X_train, y_train)
-
-    print("[5/6] Entrenando Random Forest (Bagging + Voto Mayoritario)...")
-    random_forest = RandomForestClassifier(
-        n_estimators=140,
-        criterion="gini",
-        max_depth=22,
-        max_features="sqrt",
-        min_samples_leaf=1,
-        bootstrap=True,
-        oob_score=True,
-        n_jobs=-1,
-        random_state=RANDOM_STATE,
+    random_forest = Pipeline(
+        [
+            ("vectorizer", DictVectorizer()),
+            (
+                "regressor",
+                RandomForestRegressor(
+                    n_estimators=160,
+                    criterion="squared_error",
+                    max_depth=16,
+                    max_features=0.8,
+                    min_samples_leaf=5,
+                    bootstrap=True,
+                    oob_score=True,
+                    n_jobs=-1,
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
     )
-    random_forest.fit(X_train, y_train)
     return decision_tree, random_forest
 
 
 def main() -> None:
     args = parse_args()
-
-    print("[1/6] Validando parámetros...")
-    if args.image_size <= 0:
-        raise ValueError("--image-size debe ser mayor que 0.")
-    if args.max_images_per_class < 0:
-        raise ValueError("--max-images-per-class no puede ser negativo.")
-
-    dataset_root = resolve_dataset_root(dataset_root=args.dataset_root, dataset_slug=args.dataset_slug)
-
-    print("[3/6] Cargando y preprocesando imágenes...")
-    X, y = load_dataset(
-        dataset_root=dataset_root,
-        image_size=args.image_size,
-        max_images_per_class=args.max_images_per_class,
+    print(f"[1/5] Leyendo {args.csv_name} desde {args.dataset_zip}...")
+    feature_rows, targets, metadata = load_dataset(args.dataset_zip, args.csv_name)
+    print(
+        f"Películas utilizables: {metadata['row_count']}; "
+        f"filas omitidas por datos incompletos: {metadata['skipped_missing']}; "
+        f"series omitidas: {metadata['skipped_non_movies']}."
     )
-
-    classes, class_counts = np.unique(y, return_counts=True)
-    class_distribution = {int(label): int(count) for label, count in zip(classes, class_counts)}
-    print(f"Muestras totales: {len(y)}")
-    print(f"Distribución por clase: {class_distribution}")
-    print(f"Features por imagen: {X.shape[1]}")
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
+        feature_rows,
+        targets,
         test_size=0.2,
         random_state=RANDOM_STATE,
-        stratify=y,
     )
+    decision_tree, random_forest = make_models()
 
-    decision_tree, random_forest = train_models(X_train, y_train)
+    print("[2/5] Entrenando Árbol de Decisión...")
+    decision_tree.fit(X_train, y_train)
+    print("[3/5] Entrenando Random Forest con bootstrap y OOB...")
+    random_forest.fit(X_train, y_train)
 
     dt_predictions = decision_tree.predict(X_test)
     rf_predictions = random_forest.predict(X_test)
+    metrics = {
+        "decision_tree_mae": float(mean_absolute_error(y_test, dt_predictions)),
+        "decision_tree_r2": float(r2_score(y_test, dt_predictions)),
+        "random_forest_mae": float(mean_absolute_error(y_test, rf_predictions)),
+        "random_forest_r2": float(r2_score(y_test, rf_predictions)),
+        "random_forest_oob_r2": float(
+            random_forest.named_steps["regressor"].oob_score_
+        ),
+        "test_rows": int(len(y_test)),
+    }
+    metadata["metrics"] = metrics
 
-    dt_accuracy = accuracy_score(y_test, dt_predictions)
-    rf_accuracy = accuracy_score(y_test, rf_predictions)
+    print("[4/5] Rendimiento en el conjunto de prueba:")
+    print(f"  Árbol - MAE: {metrics['decision_tree_mae']:.3f} | R²: {metrics['decision_tree_r2']:.3f}")
+    print(f"  Bosque - MAE: {metrics['random_forest_mae']:.3f} | R²: {metrics['random_forest_r2']:.3f}")
+    print(f"  OOB Random Forest (R²): {metrics['random_forest_oob_r2']:.3f}")
 
-    print("\n=== Métricas ===")
-    print(f"Accuracy Árbol de Decisión: {dt_accuracy:.4f}")
-    print(f"Accuracy Random Forest   : {rf_accuracy:.4f}")
-    print(f"OOB Score Random Forest  : {random_forest.oob_score_:.4f}")
-    print("\nReporte de clasificación (Random Forest):")
-    print(classification_report(y_test, rf_predictions, digits=4))
-
-    model_artifact = {
+    artifact = {
+        "artifact_version": 2,
         "decision_tree": decision_tree,
         "random_forest": random_forest,
-        "metadata": {
-            "dataset_type": "handwritten-digits-folder",
-            "dataset_source": args.dataset_slug if args.dataset_root is None else "local-path",
-            "dataset_root": str(dataset_root.resolve()),
-            "image_size": int(args.image_size),
-            "feature_count": int(X.shape[1]),
-            "class_labels": [int(x) for x in classes.tolist()],
-            "class_distribution": class_distribution,
-            "metrics": {
-                "decision_tree_accuracy": float(dt_accuracy),
-                "random_forest_accuracy": float(rf_accuracy),
-                "random_forest_oob_score": float(random_forest.oob_score_),
-            },
-        },
+        "metadata": metadata,
     }
-
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model_artifact, args.model_path, compress=3)
-    print(f"\n[6/6] Modelo guardado en: {args.model_path.resolve()}")
+    joblib.dump(artifact, args.model_path, compress=3)
+    print(f"[5/5] Modelo guardado en: {args.model_path.resolve()}")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: handwritten-digit-detector
+    name: mflix-movie-rating-estimator
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt

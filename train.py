@@ -1,4 +1,4 @@
-"""Entrena un Árbol de Decisión y un Random Forest para estimar la nota IMDb."""
+"""Entrena modelos de regresión para estimar la nota IMDb."""
 
 from __future__ import annotations
 
@@ -8,19 +8,22 @@ import io
 import math
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from zipfile import BadZipFile, ZipFile
 
 import joblib
 import numpy as np
-from sklearn.feature_extraction import DictVectorizer
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.feature_extraction import DictVectorizer
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeRegressor
 
 RANDOM_STATE = 42
+LOW_VOTES_QUANTILE = 0.25
 DEFAULT_DATASET_ZIP = Path("data") / "archive (1).zip"
 DEFAULT_CSV_NAME = "mflix.movies.csv"
 DEFAULT_MODEL_PATH = Path("modelo.joblib")
@@ -34,6 +37,10 @@ NUMERIC_COLUMNS = {
 GENRE_COLUMN = "genres[0]"
 TARGET_COLUMN = "imdb.rating"
 REQUIRED_COLUMNS = {*NUMERIC_COLUMNS.values(), GENRE_COLUMN, TARGET_COLUMN}
+
+
+class RatingPredictor(Protocol):
+    def predict(self, feature_rows: list[dict[str, Any]]) -> np.ndarray: ...
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,8 +164,8 @@ def load_dataset(
     return feature_rows, np.asarray(targets, dtype=np.float64), metadata
 
 
-def make_models() -> tuple[Pipeline, Pipeline]:
-    """Crea modelos interpretables y de conjunto con codificación categórica."""
+def make_models() -> tuple[Pipeline, Pipeline, Pipeline]:
+    """Crea modelos de referencia y una red neuronal para regresión."""
     decision_tree = Pipeline(
         [
             ("vectorizer", DictVectorizer()),
@@ -192,12 +199,52 @@ def make_models() -> tuple[Pipeline, Pipeline]:
             ),
         ]
     )
-    return decision_tree, random_forest
+    neural_network = Pipeline(
+        [
+            ("vectorizer", DictVectorizer(sparse=False)),
+            ("scaler", StandardScaler()),
+            (
+                "regressor",
+                MLPRegressor(
+                    hidden_layer_sizes=(64, 32),
+                    activation="relu",
+                    solver="adam",
+                    alpha=1e-3,
+                    learning_rate_init=1e-3,
+                    max_iter=500,
+                    early_stopping=True,
+                    n_iter_no_change=20,
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
+    return decision_tree, random_forest, neural_network
+
+
+def evaluate_low_votes(
+    model: RatingPredictor,
+    feature_rows: list[dict[str, Any]],
+    targets: np.ndarray,
+    threshold: float,
+) -> tuple[float | None, int]:
+    """Evalúa la red en películas del cuartil inferior de votos."""
+    low_votes_mask = np.asarray(
+        [float(row["imdb_votes"]) <= threshold for row in feature_rows],
+        dtype=bool,
+    )
+    sample_count = int(low_votes_mask.sum())
+    if sample_count == 0:
+        return None, 0
+
+    low_vote_rows = [row for row, is_low in zip(feature_rows, low_votes_mask) if is_low]
+    predictions = np.clip(model.predict(low_vote_rows), 0, 10)
+    return float(mean_absolute_error(targets[low_votes_mask], predictions)), sample_count
 
 
 def main() -> None:
     args = parse_args()
-    print(f"[1/5] Leyendo {args.csv_name} desde {args.dataset_zip}...")
+    print(f"[1/6] Leyendo {args.csv_name} desde {args.dataset_zip}...")
     feature_rows, targets, metadata = load_dataset(args.dataset_zip, args.csv_name)
     print(
         f"Películas utilizables: {metadata['row_count']}; "
@@ -211,15 +258,27 @@ def main() -> None:
         test_size=0.2,
         random_state=RANDOM_STATE,
     )
-    decision_tree, random_forest = make_models()
+    decision_tree, random_forest, neural_network = make_models()
 
-    print("[2/5] Entrenando Árbol de Decisión...")
+    print("[2/6] Entrenando Árbol de Decisión...")
     decision_tree.fit(X_train, y_train)
-    print("[3/5] Entrenando Random Forest con bootstrap y OOB...")
+    print("[3/6] Entrenando Random Forest con bootstrap y OOB...")
     random_forest.fit(X_train, y_train)
+    print("[4/6] Entrenando Red neuronal MLP...")
+    neural_network.named_steps["regressor"].set_params(
+        early_stopping=len(X_train) >= 30
+    )
+    neural_network.fit(X_train, y_train)
 
     dt_predictions = decision_tree.predict(X_test)
     rf_predictions = random_forest.predict(X_test)
+    nn_predictions = np.clip(neural_network.predict(X_test), 0, 10)
+    low_votes_threshold = float(
+        np.quantile([float(row["imdb_votes"]) for row in X_train], LOW_VOTES_QUANTILE)
+    )
+    low_votes_mae, low_votes_test_rows = evaluate_low_votes(
+        neural_network, X_test, y_test, low_votes_threshold
+    )
     metrics = {
         "decision_tree_mae": float(mean_absolute_error(y_test, dt_predictions)),
         "decision_tree_r2": float(r2_score(y_test, dt_predictions)),
@@ -228,24 +287,38 @@ def main() -> None:
         "random_forest_oob_r2": float(
             random_forest.named_steps["regressor"].oob_score_
         ),
+        "neural_network_mae": float(mean_absolute_error(y_test, nn_predictions)),
+        "neural_network_r2": float(r2_score(y_test, nn_predictions)),
+        "neural_network_low_votes_mae": low_votes_mae,
+        "low_votes_threshold": low_votes_threshold,
+        "low_votes_test_rows": low_votes_test_rows,
         "test_rows": int(len(y_test)),
     }
     metadata["metrics"] = metrics
 
-    print("[4/5] Rendimiento en el conjunto de prueba:")
+    print("[5/6] Rendimiento en el conjunto de prueba:")
     print(f"  Árbol - MAE: {metrics['decision_tree_mae']:.3f} | R²: {metrics['decision_tree_r2']:.3f}")
     print(f"  Bosque - MAE: {metrics['random_forest_mae']:.3f} | R²: {metrics['random_forest_r2']:.3f}")
+    print(f"  Red neuronal - MAE: {metrics['neural_network_mae']:.3f} | R²: {metrics['neural_network_r2']:.3f}")
+    if low_votes_mae is None:
+        print("  Prueba de pocos votos: no hubo películas en ese subconjunto de prueba.")
+    else:
+        print(
+            f"  Prueba de pocos votos (<= {low_votes_threshold:.0f}): "
+            f"MAE {low_votes_mae:.3f} en {low_votes_test_rows} películas."
+        )
     print(f"  OOB Random Forest (R²): {metrics['random_forest_oob_r2']:.3f}")
 
     artifact = {
-        "artifact_version": 2,
+        "artifact_version": 3,
         "decision_tree": decision_tree,
         "random_forest": random_forest,
+        "neural_network": neural_network,
         "metadata": metadata,
     }
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, args.model_path, compress=3)
-    print(f"[5/5] Modelo guardado en: {args.model_path.resolve()}")
+    print(f"[6/6] Modelo guardado en: {args.model_path.resolve()}")
 
 
 if __name__ == "__main__":

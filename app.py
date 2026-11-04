@@ -24,11 +24,13 @@ FEATURE_LABELS = {
 @st.cache_resource
 def load_artifact(model_path: Path) -> dict[str, Any]:
     artifact = joblib.load(model_path)
-    if not isinstance(artifact, dict) or artifact.get("artifact_version") != 2:
+    if not isinstance(artifact, dict) or artifact.get("artifact_version") not in (2, 3):
         raise ValueError(
             "El artefacto no corresponde al modelo Mflix. Vuelve a generarlo con `python train.py`."
         )
     required_keys = {"decision_tree", "random_forest", "metadata"}
+    if artifact["artifact_version"] == 3:
+        required_keys.add("neural_network")
     missing_keys = required_keys.difference(artifact)
     if missing_keys:
         raise KeyError(f"Faltan claves requeridas en el modelo: {sorted(missing_keys)}")
@@ -62,10 +64,6 @@ def make_feature_input(
 
 st.set_page_config(page_title="Predicción IMDb Mflix", page_icon="🎬", layout="wide")
 st.title("🎬 Estimador de nota IMDb para películas")
-st.caption(
-    "Árbol de Decisión y Random Forest entrenados con metadatos de Mflix; "
-    "incluye un sistema experto de reglas didácticas."
-)
 
 if not MODEL_PATH.is_file():
     st.error(
@@ -82,6 +80,16 @@ except (FileNotFoundError, KeyError, ValueError) as error:
 
 metadata = artifact["metadata"]
 metrics = metadata["metrics"]
+if "neural_network" in artifact:
+    st.caption(
+        "Árbol de Decisión, Random Forest y una red neuronal MLP entrenados con metadatos de Mflix; "
+        "incluye una prueba de robustez con películas de pocos votos y un sistema experto didáctico."
+    )
+else:
+    st.caption(
+        "Árbol de Decisión y Random Forest entrenados con metadatos de Mflix. "
+        "Vuelve a entrenar el modelo para habilitar la red neuronal y su prueba de robustez."
+    )
 
 with st.expander("📘 Qué hace el proyecto", expanded=False):
     st.markdown(
@@ -90,6 +98,8 @@ with st.expander("📘 Qué hace el proyecto", expanded=False):
         - **Entradas:** año, duración, votos IMDb, premios, nominaciones y género principal.
         - **Árbol de Decisión:** una secuencia de divisiones; limita la profundidad para reducir sobreajuste.
         - **Random Forest:** árboles entrenados con bootstrap y subconjuntos de variables; promedia sus estimaciones.
+        - **Red neuronal MLP:** capas densas con ReLU y Adam; estandariza las entradas y usa parada temprana si hay suficientes muestras.
+        - **Prueba de pocos votos:** mide por separado el MAE de la red en el cuartil inferior de votos IMDb.
         - **OOB:** R² calculado con observaciones fuera de bolsa, como comprobación interna del bosque.
         - **Sistema experto:** reglas IF/THEN legibles que interpretan la nota y las señales de premios.
           Es independiente del modelo y no cambia la estimación.
@@ -107,6 +117,28 @@ st.caption(
     f"Prueba: {metrics['test_rows']:,} películas. "
     "MAE más bajo es mejor; R² más cercano a 1 indica mejor ajuste."
 )
+if "neural_network_mae" in metrics:
+    neural_columns = st.columns(2)
+    neural_columns[0].metric("MAE — Red neuronal", f"{metrics['neural_network_mae']:.2f} puntos")
+    neural_columns[1].metric("R² — Red neuronal", f"{metrics['neural_network_r2']:.3f}")
+
+    st.markdown("#### Prueba de robustez: películas con pocos votos")
+    stress_columns = st.columns(4)
+    stress_columns[0].metric(
+        "MAE general de la red", f"{metrics['neural_network_mae']:.2f} puntos"
+    )
+    stress_columns[1].metric("Umbral de pocos votos", f"≤ {metrics['low_votes_threshold']:,.0f}")
+    stress_columns[2].metric("Películas en el caso especial", metrics["low_votes_test_rows"])
+    low_votes_mae = metrics["neural_network_low_votes_mae"]
+    stress_columns[3].metric(
+        "MAE con pocos votos",
+        "Sin casos" if low_votes_mae is None else f"{low_votes_mae:.2f} puntos",
+    )
+    st.caption(
+        "El umbral se calcula con el cuartil inferior de votos del conjunto de entrenamiento; "
+        "el error se mide en las películas de prueba que quedan por debajo. "
+        "Un MAE mayor que el general indica que este caso es más difícil para la red."
+    )
 
 st.sidebar.header("⚙️ Datos de la película")
 with st.form("movie-input"):
@@ -130,11 +162,16 @@ with st.form("movie-input"):
     award_nominations = make_feature_input(
         metadata, "awards_nominations", FEATURE_LABELS["awards_nominations"]
     )
-    model_mode = st.radio(
-        "Modelo que quieres consultar",
-        ("Comparar ambos", "Solo Árbol de Decisión", "Solo Random Forest"),
-        horizontal=True,
-    )
+    if "neural_network" in artifact:
+        model_options = (
+            "Comparar todos",
+            "Solo Árbol de Decisión",
+            "Solo Random Forest",
+            "Solo Red neuronal",
+        )
+    else:
+        model_options = ("Comparar ambos", "Solo Árbol de Decisión", "Solo Random Forest")
+    model_mode = st.radio("Modelo que quieres consultar", model_options, horizontal=True)
     submitted = st.form_submit_button("Estimar nota IMDb", type="primary")
 
 if submitted:
@@ -150,20 +187,20 @@ if submitted:
     tree_model = artifact["decision_tree"]
     forest_model = artifact["random_forest"]
     predictions: dict[str, float] = {}
-    if model_mode in ("Comparar ambos", "Solo Árbol de Decisión"):
+    if model_mode in ("Comparar ambos", "Comparar todos", "Solo Árbol de Decisión"):
         predictions["Árbol de Decisión"] = float(tree_model.predict([feature_input])[0])
-    if model_mode in ("Comparar ambos", "Solo Random Forest"):
+    if model_mode in ("Comparar ambos", "Comparar todos", "Solo Random Forest"):
         predictions["Random Forest"] = float(forest_model.predict([feature_input])[0])
+    if model_mode in ("Comparar todos", "Solo Red neuronal"):
+        neural_prediction = float(artifact["neural_network"].predict([feature_input])[0])
+        predictions["Red neuronal"] = float(np.clip(neural_prediction, 0, 10))
 
     st.subheader("Estimación")
     prediction_columns = st.columns(len(predictions))
     for column, (model_name, prediction) in zip(prediction_columns, predictions.items()):
         column.metric(model_name, f"{prediction:.2f} / 10")
 
-    if "Random Forest" in predictions:
-        chosen_prediction = predictions["Random Forest"]
-    else:
-        chosen_prediction = predictions["Árbol de Decisión"]
+    chosen_prediction = predictions.get("Random Forest", next(iter(predictions.values())))
     if "Random Forest" in predictions:
         vectorizer = forest_model.named_steps["vectorizer"]
         forest = forest_model.named_steps["regressor"]
@@ -221,5 +258,12 @@ with st.expander("📊 Métricas completas y procedencia"):
             "MAE Random Forest": metrics["random_forest_mae"],
             "R² Random Forest": metrics["random_forest_r2"],
             "R² OOB Random Forest": metrics["random_forest_oob_r2"],
+            "MAE Red neuronal": metrics.get("neural_network_mae"),
+            "R² Red neuronal": metrics.get("neural_network_r2"),
+            "Umbral de pocos votos": metrics.get("low_votes_threshold"),
+            "MAE red en películas con pocos votos": metrics.get(
+                "neural_network_low_votes_mae"
+            ),
+            "Películas con pocos votos en prueba": metrics.get("low_votes_test_rows"),
         }
     )

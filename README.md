@@ -1,6 +1,6 @@
 # Estimador de nota IMDb (Mflix)
 
-Aplicación educativa con **Árbol de Decisión**, **Random Forest** y un **sistema experto de reglas**. Usa el dataset tabular Mflix del archivo `archive (1).zip` para estimar la nota IMDb de una película a partir de sus metadatos.
+Aplicación educativa con **Árbol de Decisión**, **Random Forest**, una **red neuronal MLP** y un **sistema experto de reglas**. Usa el dataset tabular Mflix del archivo `archive (1).zip` para estimar la nota IMDb de una película a partir de sus metadatos.
 
 ## Qué predice
 
@@ -13,7 +13,9 @@ Aplicación educativa con **Árbol de Decisión**, **Random Forest** y un **sist
 
 - El árbol usa criterio de error cuadrático y profundidad limitada para reducir sobreajuste.
 - El bosque entrena árboles con **bootstrap** y subconjuntos de variables. En regresión, el resultado es la **media aritmética** de las estimaciones individuales.
+- La red neuronal es una MLP de dos capas ocultas (64 y 32 neuronas), con ReLU, Adam y regularización. Estandariza las entradas y activa parada temprana cuando el conjunto de entrenamiento tiene suficientes muestras.
 - La evaluación usa un conjunto de prueba reservado: **MAE** (menor es mejor) y **R²** (más próximo a 1 es mejor). El bosque también informa el **R² OOB**.
+- Como caso especial análogo a probar una imagen descentrada, se mide la robustez de la red en películas con pocos votos: se toma el cuartil inferior de votos del entrenamiento y se calcula el MAE de las películas de prueba que caen bajo ese umbral. El umbral se obtiene solo del entrenamiento para evitar fuga de información.
 - El sistema experto mantiene una base de reglas `IF/THEN` legible que interpreta la estimación y los premios. Sus umbrales son didácticos y no alteran el resultado del modelo.
 
 Su arquitectura se presenta como **hechos** (nota estimada y datos de premios), **base de conocimiento** (reglas R1–R7), **motor de inferencia** (condiciones IF/THEN) y **conclusión** (recomendación y reglas activadas).
@@ -43,7 +45,7 @@ Por defecto se lee `mflix.movies.csv`. Para usar el CSV alternativo de película
 python train.py --dataset-zip "C:\ruta\archive (1).zip" --csv-name "mflix.embedded_movies.csv"
 ```
 
-El entrenamiento crea o actualiza `modelo.joblib` en la raíz del proyecto e imprime MAE, R² y OOB R².
+El entrenamiento crea o actualiza `modelo.joblib` en la raíz del proyecto e imprime MAE y R² para los tres modelos, además del MAE del caso de pocos votos y el OOB R² del bosque. La aplicación también carga artefactos de la versión anterior; para usar la red neuronal, vuelve a entrenar el modelo.
 
 ## Ejecución
 
@@ -51,7 +53,7 @@ El entrenamiento crea o actualiza `modelo.joblib` en la raíz del proyecto e imp
 python -m streamlit run app.py
 ```
 
-La aplicación permite introducir los metadatos de una película, comparar las estimaciones del árbol y el bosque, inspeccionar la media y dispersión de las predicciones de los árboles y ver las reglas expertas activadas.
+La aplicación permite introducir los metadatos de una película, comparar las estimaciones de los tres modelos, inspeccionar la media y dispersión de las predicciones de los árboles y ver las reglas expertas activadas. También muestra la métrica del caso especial con pocos votos.
 
 ## Estructura
 
